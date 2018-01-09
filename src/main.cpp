@@ -189,6 +189,7 @@ void setup() {
 
   Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
+
   //inicialização das publicações MQTT
   lightNode.advertise("on").settable(lightNodeHandler);
   acNode.advertise("on").settable(acNodeHandler);

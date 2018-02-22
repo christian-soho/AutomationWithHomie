@@ -1,201 +1,211 @@
 #include <Homie.h>
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
-#include "ACS712.h"
+#include <string.h>
 
-const int LIGHT_RELAY = 5;
-const int AC_RELAY = 4;
-const int LUM_SENSOR = 2;
-//const int TEMP_HUM_SENS = 14;
+HomieNode flowNode("flow", "sensor");
+HomieNode fcalibrationNode("flow", "calibration");
+HomieNode volumeNode("volume", "sensor");
+HomieNode condsensorNode("conductivity", "sensor");
+HomieNode relay1Node("relay1", "relay");
+HomieNode relay2Node("relay2", "relay");
+HomieNode relay3Node("relay3", "relay");
 
-// Definições para o sensor de humidade e temperatura
-#define DHTPIN D5
-#define DHTTYPE DHT22
-const int TEMPERATURE_INTERVAL = 30;
-unsigned long last_temperature_sent = 0;
-const int HUMIDITY_INTERVAL = 30;
-unsigned long last_humidity_sent = 0;
 
-// Variáveis para medição de corrente
-//const int CUR_CAPTURE_INTERVAL = 1500; //ms
-//const int CUR_PUBLISH_INTERVAL = 10000; //ms
-float accumulated_current = 0;
-float average_current = 0;
-unsigned long cur_t0 = 0;
-unsigned long cur_tx = 0;
-unsigned long timestamp;
-float currentRead;
-unsigned long capture_interval;
-unsigned long publish_interval;
-int currentCounter = 0;
+// Pinos do sensor de vazão
+byte statusLed    = 3;
+byte sensorInterrupt = 14;  // 0 = digital pin 2
+byte sensorPin       = 14;
 
-// Declaração dos Nodes do Homie. Cada Node representa um topico específico de MQTT.
-// O primeiro argumento representa o subtopico que será criado após o ID do dispositivo que é configurado no processo de instalação inicial
-// O segundo argumento representa o tipo do nodo e tem finalidade meramente informativa, sem impacto na estrutura de tópico MQTT
-HomieNode lightNode("light", "relay");
-HomieNode acNode("ac", "relay");
-HomieNode luminosityNode("luminosity", "LDR");
-HomieNode temperatureNode("temperature", "AM2302");
-HomieNode humidityNode("humidity", "AM2302");
-HomieNode currentNode("current", "ACS712");
+// The hall-effect flow sensor outputs approximately 4.5 pulses per second per
+// litre/minute of flow.
+float calibrationFactor = 6.5;
+volatile byte pulseCount;
+float flowRate;
+float flowLitres;
+float totalLitres;
+unsigned long oldTime;
+unsigned long mqttTime;
+int flowWindow = 0;
+int flowInterval = 10000; //ms
 
-// Inicialização do sensor de umidade e temperatura
-DHT_Unified dht(DHTPIN, DHTTYPE);
 
-// Inicialização do sensor de corrente
-ACS712 currentSensor(ACS712_30A, A0);
+// Sensor de condutividade
+unsigned long int time_off_cond;                                          // tempo em ms
 
-// Função que obtém a temperatura do sensor, imprime na saida serial e log e publica no tópico MQTT
-void temperatureHandler() {
-  // Verifica se já está na hora de capturar a informação do sensor
-  if (millis() - last_temperature_sent >= TEMPERATURE_INTERVAL * 1000UL || last_temperature_sent == 0) {
-    // a biblioteca DHT da Adafruit sugere a utilização de uma variável evento para receber informações do sensor
-    sensors_event_t event;
-    dht.temperature().getEvent(&event);
-    //verifica se o sensor o ESP consegue receber informações do sensor
-    if (isnan(event.temperature)) {
-      Serial.println("Falha na comunicação com o sensor!");
-      return;
+/*-----------------------Medidas----------------------*/
+const float V_esp = 3.3;
+float Vm;   //Variável que irá armazenar as leituras em INT do ADC no ponto médio do divisor de tensão
+float Gx; //Condutância da solução
+
+const int RELAY1PIN = 13; //D2
+const int RELAY2PIN = 5; //D1
+const int RELAY3PIN = 4; //D2
+
+void conductivity_read(){
+  if((millis() - time_off_cond) > 15000){
+    digitalWrite(D6, 1);
+    delay(200);
+    Vm = analogRead(A0);
+    digitalWrite(D6, 0);
+    // Calculo da condutividade
+    if (Vm <=182 ){
+      Gx = 2000;
+    } else if (Vm <= 209) {
+      Gx = ((Vm-241.827567)/(-0.030691964));
+    } else if (Vm <=568.5) {
+      Gx = ((Vm-597.926)/(-0.374085684));
+    } else if (Vm <= 958){
+      Gx = ((Vm-962.930379)/(-4.930379));
+    } else if (Vm >= 958) {
+      Gx = 0;
     }
-    //variável que recebe a temperatura do evento DHT
-    float temperature = event.temperature;
-    //publica a temperatura no log do Homie
-    Homie.getLogger() << "Temperatura: " << temperature << " °C" << endl;
-    //publica a temperatura no MQTT
-    temperatureNode.setProperty("celsius").send(String(temperature));
-    //atualiza a variável com o último tempo de aquisição do registro
-    last_temperature_sent = millis();
+    /* Mensagem para o publish */
+    String messageout;
+    messageout += round(Gx);
+    Homie.getLogger() << "Condutividade: " << messageout << "uS" << endl;
+    condsensorNode.setProperty("us").send(messageout);
+    time_off_cond = millis();
   }
 }
 
-void humidityHandler() {
-  // Verifica se já está na hora de capturar a informação do sensor
-  if (millis() - last_humidity_sent >= HUMIDITY_INTERVAL * 1000UL || last_humidity_sent == 0) {
-    // a biblioteca DHT da Adafruit sugere a utilização de uma variável evento para receber informações do sensor
-    sensors_event_t event;
-    dht.humidity().getEvent(&event);
-    //verifica se o sensor o ESP consegue receber informações do sensor
-    if (isnan(event.relative_humidity)) {
-      Serial.println("Falha na comunicação com o sensor!");
-      return;
-    }
-    //variável que recebe a umidade do evento DHT
-    float humidity = event.relative_humidity;
-    //publica a temperatura no log do Homie
-    Homie.getLogger() << "Umidade: " << humidity << " %" << endl;
-    //publica a umidade no MQTT
-    humidityNode.setProperty("percentage").send(String(humidity));
-    //atualiza a variável com o último tempo de aquisição do registro
-    last_humidity_sent = millis();
-  }
+void pulseCounter()
+{
+  pulseCount++;
 }
 
-bool lightNodeHandler(const HomieRange& range, const String& value) {
+void flowLoop(){
+  flowWindow = (millis() - oldTime);
+  if(flowWindow > 1000)
+  {
+     detachInterrupt(sensorInterrupt);
+
+     flowRate = flowWindow / 1000 * pulseCount / calibrationFactor;
+
+     oldTime = millis();
+
+     flowLitres = flowRate / 60;
+
+     totalLitres += flowLitres;
+
+     unsigned int frac;
+
+     // Print the flow rate for this second in litres / minute
+     if (millis() - mqttTime > flowInterval){
+       Homie.getLogger() << "Vazão média: " << flowRate << "L/min" << endl;
+       flowNode.setProperty("lm").send(String(flowRate));
+
+       Homie.getLogger() << "Volume acumulado: " << totalLitres << "L" << endl;
+       volumeNode.setProperty("litros").send(String(totalLitres));
+
+       mqttTime = millis();
+     }
+
+     // Reset the pulse counter so we can start incrementing again
+     pulseCount = 0;
+
+     // Enable the interrupt again now that we've finished sending output
+     attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+   }
+}
+
+bool relay1NodeHandler(const HomieRange& range, const String& value) {
   if (value != "true" && value != "false") return false;
 
   bool on = (value == "true");
-  digitalWrite(LIGHT_RELAY, on ? HIGH : LOW);
-  lightNode.setProperty("on").send(value);
-  Homie.getLogger() << "Luz " << (on ? "acendeu" : "apagou") << endl;
+  digitalWrite(RELAY1PIN, on ? 1 : 0);
+  relay1Node.setProperty("on").send(value);
+  Homie.getLogger() << "Relay 1 " << (on ? "ligou" : "desligou") << endl;
 
   return true;
 }
 
-bool acNodeHandler(const HomieRange& range, const String& value) {
+bool relay2NodeHandler(const HomieRange& range, const String& value) {
   if (value != "true" && value != "false") return false;
 
   bool on = (value == "true");
-  digitalWrite(AC_RELAY, on ? HIGH : LOW);
-  acNode.setProperty("on").send(value);
-  Homie.getLogger() << "A/C " << (on ? "ligou" : "desligou") << endl;
+  digitalWrite(RELAY2PIN, on ? 1 : 0);
+  relay2Node.setProperty("on").send(value);
+  Homie.getLogger() << "Relay 2 " << (on ? "ligou" : "desligou") << endl;
 
   return true;
 }
 
-// Função que faz leituras da corrente elétrica, imprime na saida serial e log e publica no tópico MQTT
-void currentNodeHandler() {
-  timestamp = millis();
-  capture_interval = timestamp - cur_tx;
-  publish_interval = timestamp - cur_t0;
+bool relay3NodeHandler(const HomieRange& range, const String& value) {
+  if (value != "true" && value != "false") return false;
 
-  // Verifica se janela de leitura já iniciou
-  if (accumulated_current == 0){
-    cur_t0 = cur_tx = timestamp;
-    currentRead = currentSensor.getCurrentAC(60);
-    accumulated_current = currentRead;
-    currentCounter++;
-  }
-  else{
-    if (capture_interval >= 1500UL){
-      currentRead = currentSensor.getCurrentAC(60);
-      accumulated_current = accumulated_current + currentRead;
-      Homie.getLogger() << "Corrente atual: " << currentRead << " Ah" << endl;
-      cur_tx = timestamp;
-      currentCounter++;
-    }
-    if (publish_interval >= 10000UL){
-      average_current = accumulated_current / currentCounter;
-      Homie.getLogger() << "Corrente média: " << average_current << " Ah" << endl;
-      currentNode.setProperty("Ah").send(String(average_current));
-      accumulated_current = 0;
-      currentCounter = 0;
-    }
-  }
+  bool on = (value == "true");
+  digitalWrite(RELAY3PIN, on ? 1 : 0);
+  relay3Node.setProperty("on").send(value);
+  Homie.getLogger() << "Relay 3 " << (on ? "ligou" : "desligou") << endl;
+
+  return true;
 }
 
-void acs712Handler(){
-  timestamp = millis();
-  capture_interval = timestamp - cur_tx;
-  if (capture_interval >= 1500UL){
-    Homie.getLogger() << "Corrente atual: " << currentSensor.getCurrentAC(60) << " A" << endl;
-    cur_tx = timestamp;
-  }
+bool fcalibrationNodeHandler(const HomieRange& range, const String& value) {
+  if (value == "") return false;
+  calibrationFactor = atof(value.c_str());
+  fcalibrationNode.setProperty("factor").send(value);
+  Homie.getLogger() << "Fator de calibracao alterado para: " << calibrationFactor << endl;
+
+  return true;
 }
 
 void setupHandler() {
-  temperatureNode.setProperty("unit").send("c");
-  Homie.getLogger() << "Offset de calibração do sensor de corrente: " << currentSensor.calibrate() << endl;
+    // Set up the status LED line as an output
+    pinMode(statusLed, OUTPUT);
+    digitalWrite(statusLed, HIGH);  // We have an active-low LED attached
 
+    pinMode(sensorPin, INPUT);
+    digitalWrite(sensorPin, HIGH);
+
+    pulseCount        = 0;
+    flowRate          = 0.0;
+    flowLitres   = 0;
+    totalLitres  = 0;
+    oldTime           = 0;
+
+    // The Hall-effect sensor is connected to pin 2 which uses interrupt 0.
+    // Configured to trigger on a FALLING state change (transition from HIGH
+    // state to LOW state)
+    attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+
+    //inicialização dos pinos
+    pinMode(A0, INPUT);
+    pinMode(RELAY1PIN, OUTPUT);
+    pinMode(RELAY2PIN, OUTPUT);
+    pinMode(RELAY3PIN, OUTPUT);
+    pinMode(D6, OUTPUT);
+    digitalWrite(RELAY1PIN, HIGH);
+    digitalWrite(RELAY2PIN, HIGH);
+    digitalWrite(RELAY3PIN, HIGH);
+    digitalWrite(D6, LOW);
 }
 
 void loopHandler(){
-  //temperatureHandler();
-  //humidityHandler();
-  //currentNodeHandler();
-  acs712Handler();
+  flowLoop();
+  conductivity_read();
 }
 
 void setup() {
-  //inicializa a variavel DHT para coleta de temperatura e umidade
-  dht.begin();
-
   //altera o branding do Homie para soho
-  Homie_setBrand("soho");
+  Homie_setBrand("soho-labs");
 
   //inicialização da serial
   Serial.begin(115200);
   Serial << endl << endl;
 
-  //inicialização dos pinos do ESP8266
-  pinMode(LIGHT_RELAY, OUTPUT);
-  pinMode(AC_RELAY, OUTPUT);
-  pinMode(LUM_SENSOR, INPUT);
-  digitalWrite(LIGHT_RELAY, LOW);
-  digitalWrite(AC_RELAY, LOW);
-
   //Versão do firmware que é exibida na configuração inicial e utilizada para atualizações OTA
-  Homie_setFirmware("soho-automation", "0.0.1");
-
-  Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
-
+  Homie_setFirmware("soholabs-waterAnalisys", "0.1");
 
   //inicialização das publicações MQTT
-  lightNode.advertise("on").settable(lightNodeHandler);
-  acNode.advertise("on").settable(acNodeHandler);
-  humidityNode.advertise("percentage");
-  temperatureNode.advertise("celsius");
-  currentNode.advertise("current");
+  flowNode.advertise("lm");
+  volumeNode.advertise("litros");
+  condsensorNode.advertise("us");
+  relay1Node.advertise("on").settable(relay1NodeHandler);
+  relay2Node.advertise("on").settable(relay2NodeHandler);
+  relay3Node.advertise("on").settable(relay3NodeHandler);
+  fcalibrationNode.advertise("factor").settable(fcalibrationNodeHandler);
+
+  Homie.setSetupFunction(setupHandler).setLoopFunction(loopHandler);
 
   Homie.setup();
 }
